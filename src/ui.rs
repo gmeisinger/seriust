@@ -7,7 +7,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-use crate::app::{App, AppState};
+use crate::app::{App, AppState, ConnectionStatus};
 
 pub fn draw(app: &App, frame: &mut Frame) {
     // outer shell
@@ -46,7 +46,7 @@ pub fn draw(app: &App, frame: &mut Frame) {
 
     if app.app_state != AppState::Capturing {
         match app.app_state {
-            AppState::Options => render_menu(frame),
+            AppState::Options => render_menu(app, frame),
             AppState::PortList => render_port_list(app, frame),
             _ => {}
         }
@@ -78,7 +78,7 @@ fn render_input(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_status(app: &App, frame: &mut Frame, area: Rect) {
-    let connected = app.serial_config.port_info.is_some();
+    let connected = app.connection_status == ConnectionStatus::Connected;
     let port_string = if let Some(info) = &app.serial_config.port_info {
         info.port_name.clone()
     } else {
@@ -110,7 +110,7 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_menu(frame: &mut Frame) {
+fn render_menu(app: &App, frame: &mut Frame) {
     let area = frame.area();
     let popup_width = 40.min(area.width.saturating_sub(4));
     let popup_height = 10.min(area.height.saturating_sub(4));
@@ -120,8 +120,11 @@ fn render_menu(frame: &mut Frame) {
 
     frame.render_widget(Clear, popup_area);
 
+    let echo_label = if app.local_echo { "ON" } else { "OFF" };
     let menu_items = vec![
         Line::from("  [P] Select Port"),
+        Line::from("  [D] Disconnect"),
+        Line::from(format!("  [E] Local Echo: {}", echo_label)),
         Line::from("  [B] Change Baud Rate"),
         Line::from("  [X] Exit"),
         Line::from(""),
@@ -157,8 +160,14 @@ fn render_port_list(app: &App, frame: &mut Frame) {
                 serialport::SerialPortType::BluetoothPort => "Bluetooth",
                 serialport::SerialPortType::Unknown => "Unknown",
             };
-            let is_connected = app.serial_config.port_info.is_some();
-            let indicator = if is_connected {
+            let is_connected_port = app.connection_status == ConnectionStatus::Connected
+                && app
+                    .serial_config
+                    .port_info
+                    .as_ref()
+                    .map(|info| info.port_name == p.port_name)
+                    .unwrap_or(false);
+            let indicator = if is_connected_port {
                 Span::from("● ").green()
             } else {
                 Span::from("  ")

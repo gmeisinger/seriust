@@ -1,9 +1,11 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::io;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 
-use crate::serial::SerialConfig;
+use crate::serial::{self, SerialCommand, SerialConfig, SerialEvent, SerialHandle};
 use crate::{Args, ui};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -13,7 +15,12 @@ pub enum AppState {
     PortList,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum ConnectionStatus {
+    Connected,
+    Disconnected,
+}
+
 pub struct App {
     pub args: Args,
     pub exit: bool,
@@ -24,6 +31,10 @@ pub struct App {
     pub available_ports: Vec<serialport::SerialPortInfo>,
     pub port_error: Option<String>,
     pub port_list_index: usize,
+    pub connection_status: ConnectionStatus,
+    pub local_echo: bool,
+    serial_handle: Option<SerialHandle>,
+    last_port_scan: Instant,
 }
 
 impl App {
@@ -38,6 +49,10 @@ impl App {
             available_ports: Vec::new(),
             port_error: None,
             port_list_index: 0,
+            connection_status: ConnectionStatus::Disconnected,
+            local_echo: true,
+            serial_handle: None,
+            last_port_scan: Instant::now(),
         }
     }
 
@@ -68,36 +83,40 @@ impl App {
         };
 
         if self.serial_config.port_info.is_some() {
-            !todo!() // try to connect
+            self.try_connect();
         } else {
             self.app_state = AppState::Options;
         }
+
+        self.scan_ports();
+
         while !self.exit {
-            match serialport::available_ports() {
-                Ok(ports) => {
-                    self.available_ports = ports;
-                    self.port_error = None;
-                }
-                Err(e) => {
-                    self.available_ports.clear();
-                    self.port_error = Some(e.to_string());
-                }
+            if self.last_port_scan.elapsed() >= Duration::from_secs(2) {
+                self.scan_ports();
+                self.last_port_scan = Instant::now();
             }
+
+            self.drain_serial_events();
             terminal.draw(|frame| ui::draw(self, frame))?;
             self.handle_events()?;
         }
+
+        if let Some(handle) = self.serial_handle.take() {
+            handle.disconnect();
+        }
+
         Ok(())
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
-        match event::read()? {
-            // it's important to check that the event is a key press event as
-            // crossterm also emits key release and repeat events on Windows.
-            Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-                self.handle_key_event(key_event)
-            }
-            _ => {}
-        };
+        if event::poll(Duration::from_millis(16))? {
+            match event::read()? {
+                Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
+                    self.handle_key_event(key_event)
+                }
+                _ => {}
+            };
+        }
         Ok(())
     }
 
@@ -124,8 +143,7 @@ impl App {
                     self.input_buffer.pop();
                 }
                 KeyCode::Enter => {
-                    // send to port
-                    self.input_buffer.clear();
+                    self.send_input();
                 }
                 _ => {}
             }
@@ -144,6 +162,13 @@ impl App {
                 KeyCode::Char('p') => {
                     self.port_list_index = 0;
                     self.app_state = AppState::PortList;
+                }
+                KeyCode::Char('d') => {
+                    self.disconnect();
+                    self.app_state = AppState::Capturing;
+                }
+                KeyCode::Char('e') => {
+                    self.local_echo = !self.local_echo;
                 }
                 KeyCode::Char('x') => self.exit(),
                 _ => {}
@@ -164,7 +189,7 @@ impl App {
                 KeyCode::Enter => {
                     if let Some(port) = self.available_ports.get(self.port_list_index) {
                         self.serial_config.port_info = Some(port.clone());
-                        // try to connect
+                        self.try_connect();
                         self.app_state = AppState::Capturing;
                     }
                 }
@@ -174,7 +199,99 @@ impl App {
         }
     }
 
+    fn try_connect(&mut self) {
+        if let Some(handle) = self.serial_handle.take() {
+            handle.disconnect();
+        }
+
+        match serial::connect(&self.serial_config) {
+            Ok(handle) => {
+                self.serial_handle = Some(handle);
+                self.connection_status = ConnectionStatus::Connected;
+                self.port_error = None;
+                self.output_buffer.push_str("[Connected]\n");
+            }
+            Err(e) => {
+                self.connection_status = ConnectionStatus::Disconnected;
+                self.port_error = Some(e);
+            }
+        }
+    }
+
+    fn disconnect(&mut self) {
+        if let Some(handle) = self.serial_handle.take() {
+            handle.disconnect();
+        }
+        self.connection_status = ConnectionStatus::Disconnected;
+        self.output_buffer.push_str("[Disconnected]\n");
+    }
+
+    fn drain_serial_events(&mut self) {
+        let Some(handle) = self.serial_handle.as_ref() else {
+            return;
+        };
+
+        loop {
+            match handle.event_rx.try_recv() {
+                Ok(SerialEvent::Data(data)) => {
+                    self.output_buffer
+                        .push_str(&String::from_utf8_lossy(&data));
+                }
+                Ok(SerialEvent::Error(msg)) => {
+                    self.output_buffer
+                        .push_str(&format!("[Error: {}]\n", msg));
+                }
+                Ok(SerialEvent::Disconnected) => {
+                    self.serial_handle = None;
+                    self.connection_status = ConnectionStatus::Disconnected;
+                    self.output_buffer.push_str("[Disconnected]\n");
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.serial_handle = None;
+                    self.connection_status = ConnectionStatus::Disconnected;
+                    self.output_buffer.push_str("[Connection lost]\n");
+                    return;
+                }
+            }
+        }
+    }
+
+    fn send_input(&mut self) {
+        if self.input_buffer.is_empty() {
+            return;
+        }
+
+        if let Some(handle) = self.serial_handle.as_ref() {
+            let mut data = self.input_buffer.clone().into_bytes();
+            data.push(b'\r');
+            data.push(b'\n');
+            let _ = handle.command_tx.send(SerialCommand::Send(data));
+        }
+        if self.local_echo {
+            self.output_buffer.push_str(&self.input_buffer);
+            self.output_buffer.push('\n');
+        }
+        self.input_buffer.clear();
+    }
+
+    fn scan_ports(&mut self) {
+        match serialport::available_ports() {
+            Ok(ports) => {
+                self.available_ports = ports;
+            }
+            Err(e) => {
+                self.available_ports.clear();
+                self.port_error = Some(e.to_string());
+            }
+        }
+    }
+
     fn exit(&mut self) {
+        if let Some(handle) = self.serial_handle.take() {
+            handle.disconnect();
+        }
         self.exit = true;
     }
 }
