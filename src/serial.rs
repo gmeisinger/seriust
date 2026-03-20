@@ -34,7 +34,7 @@ impl SerialHandle {
 }
 
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SerialConfig {
     pub port_info: Option<SerialPortInfo>,
     pub baud: u32,

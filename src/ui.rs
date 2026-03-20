@@ -1,21 +1,53 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Style, Stylize},
+    style::{Color, Style},
     symbols::border,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-use crate::app::{App, AppState, ConnectionStatus};
+use crate::app::{App, AppState, ConnectionStatus, InputMode, MenuItem};
+
+fn parity_char(p: serialport::Parity) -> char {
+    match p {
+        serialport::Parity::None => 'N',
+        serialport::Parity::Odd => 'O',
+        serialport::Parity::Even => 'E',
+    }
+}
+
+fn data_bits_char(d: serialport::DataBits) -> char {
+    match d {
+        serialport::DataBits::Five => '5',
+        serialport::DataBits::Six => '6',
+        serialport::DataBits::Seven => '7',
+        serialport::DataBits::Eight => '8',
+    }
+}
+
+fn stop_bits_char(s: serialport::StopBits) -> char {
+    match s {
+        serialport::StopBits::One => '1',
+        serialport::StopBits::Two => '2',
+    }
+}
 
 pub fn draw(app: &App, frame: &mut Frame) {
-    // outer shell
-    let instructions = Line::from(vec![" <CTRL+A> ".bold(), " OPTIONS ".into()]);
+    let title_style = if app.connection_status == ConnectionStatus::Connected {
+        Style::default().fg(Color::Green).bold()
+    } else {
+        Style::default().bold()
+    };
+    let instructions = Line::from(vec![
+        Span::styled(" Ctrl+A ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Options ", Style::default().fg(Color::DarkGray)),
+    ]);
     let outer = Block::bordered()
-        .title(" Seriust ")
+        .title(Span::styled(" Seriust ", title_style))
         .title_bottom(instructions.right_aligned())
-        .border_set(border::PLAIN);
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::DarkGray));
     let inner = outer.inner(frame.area());
     frame.render_widget(outer, frame.area());
 
@@ -26,23 +58,18 @@ pub fn draw(app: &App, frame: &mut Frame) {
     ])
     .areas(inner);
 
-    // Render each inner area
     render_output(app, frame, output_area);
     render_input(app, frame, input_area);
     render_status(app, frame, status_area);
 
     // Merging borders manually
     let area = frame.area();
+    let border_style = Style::default().fg(Color::DarkGray);
     let buf = frame.buffer_mut();
-    buf.set_string(area.x, input_area.y, "├", Style::default());
-    buf.set_string(area.x + area.width - 1, input_area.y, "┤", Style::default());
-    buf.set_string(area.x, status_area.y, "├", Style::default());
-    buf.set_string(
-        area.x + area.width - 1,
-        status_area.y,
-        "┤",
-        Style::default(),
-    );
+    buf.set_string(area.x, input_area.y, "├", border_style);
+    buf.set_string(area.x + area.width - 1, input_area.y, "┤", border_style);
+    buf.set_string(area.x, status_area.y, "├", border_style);
+    buf.set_string(area.x + area.width - 1, status_area.y, "┤", border_style);
 
     if app.app_state != AppState::Capturing {
         match app.app_state {
@@ -55,24 +82,55 @@ pub fn draw(app: &App, frame: &mut Frame) {
 
 fn render_output(app: &App, frame: &mut Frame, area: Rect) {
     let block = Block::new();
-    let paragraph = if let Some(err) = &app.port_error {
-        Paragraph::new(Line::from(Span::from(err.as_str()).red()))
-            .block(block)
-            .wrap(Wrap { trim: false })
+
+    if let Some(err) = &app.port_error {
+        let paragraph = Paragraph::new(Line::from(Span::styled(
+            err.as_str(),
+            Style::default().fg(Color::Red),
+        )))
+        .block(block)
+        .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let lines: Vec<Line> = app
+        .output_buffer
+        .lines()
+        .map(|l| Line::from(l.to_string()))
+        .collect();
+
+    let visible_height = area.height as usize;
+    let scroll = if lines.len() > visible_height {
+        (lines.len() - visible_height) as u16
     } else {
-        Paragraph::new(format!("{}", app.output_buffer))
-            .block(block)
-            .wrap(Wrap { trim: false })
+        0
     };
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
 }
 
 fn render_input(app: &App, frame: &mut Frame, area: Rect) {
-    let input_prompt = Line::from(vec![
-        Span::from("> "),
-        Span::from(app.input_buffer.to_string()),
-    ]);
-    let block = Block::new().borders(Borders::TOP).border_set(border::PLAIN);
+    let (prompt, display_text) = match app.input_mode {
+        InputMode::Ascii => (
+            Span::styled("> ", Style::default().fg(Color::DarkGray)),
+            app.input_buffer.clone(),
+        ),
+        InputMode::Hex => (
+            Span::styled("HEX> ", Style::default().fg(Color::Yellow).bold()),
+            app.hex_display_buffer(),
+        ),
+    };
+
+    let input_prompt = Line::from(vec![prompt, Span::from(display_text)]);
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::DarkGray));
     let paragraph = Paragraph::new(input_prompt).block(block);
     frame.render_widget(paragraph, area);
 }
@@ -82,64 +140,135 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
     let port_string = if let Some(info) = &app.serial_config.port_info {
         info.port_name.clone()
     } else {
-        " - ".to_string()
+        "—".to_string()
     };
-    let baud_string = if connected {
-        app.serial_config.baud.to_string()
-    } else {
-        " - ".to_string()
-    };
+
+    let config_shorthand = format!(
+        " {} {}{}{}",
+        app.serial_config.baud,
+        data_bits_char(app.serial_config.data_bits),
+        parity_char(app.serial_config.parity),
+        stop_bits_char(app.serial_config.stop_bits),
+    );
+
     let indicator_span = if connected {
-        Span::from(" ● ").green()
+        Span::styled(" ● ", Style::default().fg(Color::Green))
     } else {
-        Span::from(" ● ").red()
+        Span::styled(" ● ", Style::default().fg(Color::Red))
     };
-    let connected_string = if connected {
-        " Connected "
+
+    let status_text = if connected {
+        "Connected"
     } else {
-        " Disconnected "
+        "Disconnected"
     };
-    let status_line = Line::from(vec![
-        Span::from(port_string).bold(),
-        Span::from(baud_string).dark_gray(),
+
+    let mut spans = vec![
+        Span::styled(port_string, Style::default().bold()),
+        Span::styled(config_shorthand, Style::default().fg(Color::DarkGray)),
         indicator_span,
-        Span::from(connected_string),
-    ]);
-    let block = Block::new().borders(Borders::TOP).border_set(border::PLAIN);
+        Span::from(format!("{} ", status_text)),
+    ];
+
+    if app.input_mode == InputMode::Hex {
+        spans.push(Span::styled(" HEX ", Style::default().fg(Color::Yellow).bold()));
+    }
+
+    let status_line = Line::from(spans);
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(Color::DarkGray));
     let paragraph = Paragraph::new(status_line).block(block);
     frame.render_widget(paragraph, area);
 }
 
 fn render_menu(app: &App, frame: &mut Frame) {
     let area = frame.area();
-    let popup_width = 40.min(area.width.saturating_sub(4));
-    let popup_height = 10.min(area.height.saturating_sub(4));
+    let items = app.build_menu_items();
+
+    // Each SectionHeader adds 2 lines (blank + header), others add 1, plus 1 trailing blank
+    let section_count = items
+        .iter()
+        .filter(|i| matches!(i, MenuItem::SectionHeader(_)))
+        .count() as u16;
+    let content_height = items.len() as u16 + section_count + 1;
+    let popup_width = 46.min(area.width.saturating_sub(4));
+    let popup_height = (content_height + 2).min(area.height.saturating_sub(4));
     let popup_x = (area.width.saturating_sub(popup_width)) / 2 + area.x;
     let popup_y = (area.height.saturating_sub(popup_height)) / 2 + area.y;
     let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
-    let echo_label = if app.local_echo { "ON" } else { "OFF" };
-    let menu_items = vec![
-        Line::from("  [P] Select Port"),
-        Line::from("  [D] Disconnect"),
-        Line::from(format!("  [E] Local Echo: {}", echo_label)),
-        Line::from("  [B] Change Baud Rate"),
-        Line::from("  [X] Exit"),
-        Line::from(""),
-        Line::from("  Press ESC to close"),
-    ];
     let menu_block = Block::bordered()
-        .title(" Options ")
-        .border_set(border::DOUBLE);
-    let menu = Paragraph::new(menu_items).block(menu_block);
+        .title(Span::styled(
+            " Options ",
+            Style::default().bold(),
+        ))
+        .border_set(border::DOUBLE)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner_width = popup_width.saturating_sub(2) as usize; // inside borders
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    for (i, item) in items.iter().enumerate() {
+        let is_selected = i == app.menu_cursor;
+
+        match item {
+            MenuItem::SectionHeader(title) => {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", title),
+                    Style::default().fg(Color::Cyan).bold(),
+                )));
+            }
+            MenuItem::Action { label, .. } => {
+                let cursor = if is_selected { "  > " } else { "    " };
+                let text = format!("{}{}", cursor, label);
+                let padded = format!("{:<width$}", text, width = inner_width);
+                let style = if is_selected {
+                    Style::default().reversed()
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::styled(padded, style));
+            }
+            MenuItem::Cycle { label, value, .. } => {
+                let cursor = if is_selected { "  > " } else { "    " };
+                let arrows_left = if is_selected { "◂ " } else { "  " };
+                let arrows_right = if is_selected { " ▸" } else { "  " };
+                let value_with_arrows =
+                    format!("{}{}{}", arrows_left, value, arrows_right);
+                let label_part = format!("{}{}", cursor, label);
+                let padding = inner_width
+                    .saturating_sub(label_part.len() + value_with_arrows.len());
+                let text = format!(
+                    "{}{}{}",
+                    label_part,
+                    " ".repeat(padding),
+                    value_with_arrows
+                );
+                let style = if is_selected {
+                    Style::default().reversed()
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::styled(text, style));
+            }
+        }
+    }
+
+    lines.push(Line::from("")); // bottom padding
+
+    let menu = Paragraph::new(lines).block(menu_block);
     frame.render_widget(menu, popup_area);
 }
 
 fn render_port_list(app: &App, frame: &mut Frame) {
     let area = frame.area();
-    let list_width = 40.min(area.width.saturating_sub(4));
+    let list_width = 44.min(area.width.saturating_sub(4));
     let list_height = (app.available_ports.len() as u16 + 2).min(area.height.saturating_sub(4));
     let list_x = (area.width.saturating_sub(list_width)) / 2 + area.x;
     let list_y = (area.height.saturating_sub(list_height)) / 2 + area.y;
@@ -147,8 +276,8 @@ fn render_port_list(app: &App, frame: &mut Frame) {
 
     frame.render_widget(Clear, list_area);
 
-    let indicator_width = 2; // "● " or "  "
-    let inner_width = list_width.saturating_sub(2) as usize; // account for borders
+    let indicator_width = 2;
+    let inner_width = list_width.saturating_sub(2) as usize;
     let items: Vec<Line> = app
         .available_ports
         .iter()
@@ -157,8 +286,8 @@ fn render_port_list(app: &App, frame: &mut Frame) {
             let type_label = match &p.port_type {
                 serialport::SerialPortType::UsbPort(_) => "USB",
                 serialport::SerialPortType::PciPort => "PCI",
-                serialport::SerialPortType::BluetoothPort => "Bluetooth",
-                serialport::SerialPortType::Unknown => "Unknown",
+                serialport::SerialPortType::BluetoothPort => "BT",
+                serialport::SerialPortType::Unknown => "?",
             };
             let is_connected_port = app.connection_status == ConnectionStatus::Connected
                 && app
@@ -168,7 +297,7 @@ fn render_port_list(app: &App, frame: &mut Frame) {
                     .map(|info| info.port_name == p.port_name)
                     .unwrap_or(false);
             let indicator = if is_connected_port {
-                Span::from("● ").green()
+                Span::styled("● ", Style::default().fg(Color::Green))
             } else {
                 Span::from("  ")
             };
@@ -179,7 +308,7 @@ fn render_port_list(app: &App, frame: &mut Frame) {
                 indicator,
                 Span::from(name.as_str()),
                 Span::from(" ".repeat(padding)),
-                Span::from(type_label).dark_gray(),
+                Span::styled(type_label, Style::default().fg(Color::DarkGray)),
             ]);
             if i == app.port_list_index {
                 line = line.style(Style::default().reversed());
@@ -187,6 +316,10 @@ fn render_port_list(app: &App, frame: &mut Frame) {
             line
         })
         .collect();
-    let list = Paragraph::new(items).block(Block::bordered());
+    let list_block = Block::bordered()
+        .title(Span::styled(" Select Port ", Style::default().bold()))
+        .border_set(border::DOUBLE)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let list = Paragraph::new(items).block(list_block);
     frame.render_widget(list, list_area);
 }
