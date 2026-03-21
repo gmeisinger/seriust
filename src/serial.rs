@@ -96,7 +96,7 @@ fn serial_worker(
     loop {
         match command_rx.try_recv() {
             Ok(SerialCommand::Send(data)) => {
-                if let Err(e) = port.write_all(&data) {
+                if let Err(e) = port.write_all(&data).and_then(|_| port.flush()) {
                     let _ = event_tx.send(SerialEvent::Error(e.to_string()));
                 }
             }

@@ -171,7 +171,10 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
     ];
 
     if app.input_mode == InputMode::Hex {
-        spans.push(Span::styled(" HEX ", Style::default().fg(Color::Yellow).bold()));
+        spans.push(Span::styled(
+            " HEX ",
+            Style::default().fg(Color::Yellow).bold(),
+        ));
     }
 
     let status_line = Line::from(spans);
@@ -193,7 +196,7 @@ fn render_menu(app: &App, frame: &mut Frame) {
         .filter(|i| matches!(i, MenuItem::SectionHeader(_)))
         .count() as u16;
     let content_height = items.len() as u16 + section_count + 1;
-    let popup_width = 46.min(area.width.saturating_sub(4));
+    let popup_width = 46_u16.min(area.width.saturating_sub(4));
     let popup_height = (content_height + 2).min(area.height.saturating_sub(4));
     let popup_x = (area.width.saturating_sub(popup_width)) / 2 + area.x;
     let popup_y = (area.height.saturating_sub(popup_height)) / 2 + area.y;
@@ -202,10 +205,7 @@ fn render_menu(app: &App, frame: &mut Frame) {
     frame.render_widget(Clear, popup_area);
 
     let menu_block = Block::bordered()
-        .title(Span::styled(
-            " Options ",
-            Style::default().bold(),
-        ))
+        .title(Span::styled(" Options ", Style::default().bold()))
         .border_set(border::DOUBLE)
         .border_style(Style::default().fg(Color::DarkGray));
 
@@ -239,17 +239,11 @@ fn render_menu(app: &App, frame: &mut Frame) {
                 let cursor = if is_selected { "  > " } else { "    " };
                 let arrows_left = if is_selected { "◂ " } else { "  " };
                 let arrows_right = if is_selected { " ▸" } else { "  " };
-                let value_with_arrows =
-                    format!("{}{}{}", arrows_left, value, arrows_right);
+                let value_with_arrows = format!("{}{}{}", arrows_left, value, arrows_right);
                 let label_part = format!("{}{}", cursor, label);
-                let padding = inner_width
-                    .saturating_sub(label_part.len() + value_with_arrows.len());
-                let text = format!(
-                    "{}{}{}",
-                    label_part,
-                    " ".repeat(padding),
-                    value_with_arrows
-                );
+                let padding =
+                    inner_width.saturating_sub(label_part.len() + value_with_arrows.len());
+                let text = format!("{}{}{}", label_part, " ".repeat(padding), value_with_arrows);
                 let style = if is_selected {
                     Style::default().reversed()
                 } else {
@@ -268,7 +262,7 @@ fn render_menu(app: &App, frame: &mut Frame) {
 
 fn render_port_list(app: &App, frame: &mut Frame) {
     let area = frame.area();
-    let list_width = 44.min(area.width.saturating_sub(4));
+    let list_width = 44_u16.min(area.width.saturating_sub(4));
     let list_height = (app.available_ports.len() as u16 + 2).min(area.height.saturating_sub(4));
     let list_x = (area.width.saturating_sub(list_width)) / 2 + area.x;
     let list_y = (area.height.saturating_sub(list_height)) / 2 + area.y;
