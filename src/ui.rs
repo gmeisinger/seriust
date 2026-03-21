@@ -144,7 +144,7 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
     };
 
     let config_shorthand = format!(
-        " {} {}{}{}",
+        " {:>6} {}{}{}",
         app.serial_config.baud,
         data_bits_char(app.serial_config.data_bits),
         parity_char(app.serial_config.parity),
@@ -164,10 +164,9 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
     };
 
     let mut spans = vec![
-        Span::styled(port_string, Style::default().bold()),
         Span::styled(config_shorthand, Style::default().fg(Color::DarkGray)),
         indicator_span,
-        Span::from(format!("{} ", status_text)),
+        Span::from(format!("{:<12} ", status_text)),
     ];
 
     if app.input_mode == InputMode::Hex {
@@ -176,6 +175,8 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
             Style::default().fg(Color::Yellow).bold(),
         ));
     }
+
+    spans.push(Span::styled(port_string, Style::default().bold()));
 
     let status_line = Line::from(spans);
     let block = Block::new()
