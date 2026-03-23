@@ -3,6 +3,11 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use serialport::{DataBits, FlowControl, Parity, SerialPortInfo, StopBits};
 
 // Messages from worker thread -> App
@@ -63,27 +68,55 @@ pub fn connect(config: &SerialConfig) -> Result<SerialHandle, String> {
         .as_ref()
         .ok_or_else(|| "No port selected".to_string())?;
 
-    let port = serialport::new(&port_info.port_name, config.baud)
+    let (event_tx, event_rx) = mpsc::channel();
+    let (command_tx, command_rx) = mpsc::channel();
+
+    // Try opening as a serial port first; fall back to raw file (for PTYs/socat)
+    let serial_result = serialport::new(&port_info.port_name, config.baud)
         .data_bits(config.data_bits)
         .parity(config.parity)
         .stop_bits(config.stop_bits)
         .flow_control(config.flow_control)
         .timeout(Duration::from_millis(10))
-        .open()
-        .map_err(|e| e.to_string())?;
+        .open();
 
-    let (event_tx, event_rx) = mpsc::channel();
-    let (command_tx, command_rx) = mpsc::channel();
+    match serial_result {
+        Ok(port) => {
+            let worker_thread = thread::spawn(move || {
+                serial_worker(port, event_tx, command_rx);
+            });
+            Ok(SerialHandle {
+                event_rx,
+                command_tx,
+                worker_thread: Some(worker_thread),
+            })
+        }
+        Err(_serial_err) => {
+            // Fall back to raw file open (works for PTYs, socat, etc.)
+            #[cfg(unix)]
+            {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+                    .open(&port_info.port_name)
+                    .map_err(|e| format!("{}", e))?;
 
-    let worker_thread = thread::spawn(move || {
-        serial_worker(port, event_tx, command_rx);
-    });
-
-    Ok(SerialHandle {
-        event_rx,
-        command_tx,
-        worker_thread: Some(worker_thread),
-    })
+                let worker_thread = thread::spawn(move || {
+                    raw_file_worker(file, event_tx, command_rx);
+                });
+                Ok(SerialHandle {
+                    event_rx,
+                    command_tx,
+                    worker_thread: Some(worker_thread),
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                Err(_serial_err.to_string())
+            }
+        }
+    }
 }
 
 fn serial_worker(
@@ -116,6 +149,54 @@ fn serial_worker(
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::BrokenPipe
+                    || e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                let _ = event_tx.send(SerialEvent::Error(e.to_string()));
+                let _ = event_tx.send(SerialEvent::Disconnected);
+                return;
+            }
+            Err(e) => {
+                let _ = event_tx.send(SerialEvent::Error(e.to_string()));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn raw_file_worker(
+    mut file: std::fs::File,
+    event_tx: mpsc::Sender<SerialEvent>,
+    command_rx: mpsc::Receiver<SerialCommand>,
+) {
+    let mut buf = [0u8; 1024];
+
+    loop {
+        match command_rx.try_recv() {
+            Ok(SerialCommand::Send(data)) => {
+                if let Err(e) = file.write_all(&data).and_then(|_| file.flush()) {
+                    let _ = event_tx.send(SerialEvent::Error(e.to_string()));
+                }
+            }
+            Ok(SerialCommand::Disconnect) => {
+                let _ = event_tx.send(SerialEvent::Disconnected);
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => return,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        match file.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => {
+                if event_tx.send(SerialEvent::Data(buf[..n].to_vec())).is_err() {
+                    return;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::BrokenPipe
                     || e.kind() == std::io::ErrorKind::PermissionDenied =>

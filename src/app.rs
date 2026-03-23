@@ -268,6 +268,13 @@ impl App {
             _ => serialport::FlowControl::None,
         };
 
+        if let Some(ref port_name) = self.args.port {
+            self.serial_config.port_info = Some(serialport::SerialPortInfo {
+                port_name: port_name.clone(),
+                port_type: serialport::SerialPortType::Unknown,
+            });
+        }
+
         if self.serial_config.port_info.is_some() {
             self.try_connect();
         } else {
