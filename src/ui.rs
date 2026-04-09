@@ -94,24 +94,25 @@ fn render_output(app: &App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    let lines: Vec<Line> = app
-        .output_buffer
+    let cleaned = strip_ansi_escapes::strip_str(&app.output_buffer);
+    let lines: Vec<Line> = cleaned
         .lines()
         .map(|l| Line::from(l.to_string()))
         .collect();
 
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+
+    let total_visual_lines = paragraph.line_count(area.width) as usize;
     let visible_height = area.height as usize;
-    let scroll = if lines.len() > visible_height {
-        (lines.len() - visible_height) as u16
+    let scroll = if total_visual_lines > visible_height {
+        (total_visual_lines - visible_height) as u16
     } else {
         0
     };
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph.scroll((scroll, 0)), area);
 }
 
 fn render_input(app: &App, frame: &mut Frame, area: Rect) {

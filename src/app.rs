@@ -11,6 +11,7 @@ use crate::{Args, ui};
 pub const BAUD_RATES: &[u32] = &[
     300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600,
 ];
+const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AppState {
@@ -639,12 +640,10 @@ impl App {
         loop {
             match handle.event_rx.try_recv() {
                 Ok(SerialEvent::Data(data)) => {
-                    self.output_buffer
-                        .push_str(&String::from_utf8_lossy(&data));
+                    self.output_buffer.push_str(&String::from_utf8_lossy(&data));
                 }
                 Ok(SerialEvent::Error(msg)) => {
-                    self.output_buffer
-                        .push_str(&format!("[Error: {}]\n", msg));
+                    self.output_buffer.push_str(&format!("[Error: {}]\n", msg));
                 }
                 Ok(SerialEvent::Disconnected) => {
                     self.serial_handle = None;
@@ -659,6 +658,13 @@ impl App {
                     self.output_buffer.push_str("[Connection lost]\n");
                     return;
                 }
+            }
+        }
+        // If output is too large, truncate from front
+        if self.output_buffer.len() > MAX_OUTPUT_BYTES {
+            let excess = self.output_buffer.len() - MAX_OUTPUT_BYTES;
+            if let Some(newline_pos) = self.output_buffer[excess..].find('\n') {
+                self.output_buffer.drain(..excess + newline_pos + 1);
             }
         }
     }
@@ -700,9 +706,7 @@ impl App {
                     .collect();
 
                 if let Some(handle) = self.serial_handle.as_ref() {
-                    let _ = handle
-                        .command_tx
-                        .send(SerialCommand::Send(bytes.clone()));
+                    let _ = handle.command_tx.send(SerialCommand::Send(bytes.clone()));
                 }
                 if self.local_echo {
                     let hex_display: Vec<String> =
