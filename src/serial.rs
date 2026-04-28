@@ -81,7 +81,15 @@ pub fn connect(config: &SerialConfig) -> Result<SerialHandle, String> {
         .open();
 
     match serial_result {
-        Ok(port) => {
+        Ok(mut port) => {
+            // Many devices (USB-CDC boards, FTDI/CH340 adapters) won't transmit
+            // until the host asserts DTR. On macOS/Linux the OS tty defaults
+            // leave these asserted; on Windows they default low.
+            let _ = port.write_data_terminal_ready(true);
+            if config.flow_control != FlowControl::Hardware {
+                let _ = port.write_request_to_send(true);
+            }
+
             let worker_thread = thread::spawn(move || {
                 serial_worker(port, event_tx, command_rx);
             });
