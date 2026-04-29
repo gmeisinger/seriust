@@ -157,16 +157,10 @@ fn serial_worker(
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::BrokenPipe
-                    || e.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
+            Err(e) => {
                 let _ = event_tx.send(SerialEvent::Error(e.to_string()));
                 let _ = event_tx.send(SerialEvent::Disconnected);
                 return;
-            }
-            Err(e) => {
-                let _ = event_tx.send(SerialEvent::Error(e.to_string()));
             }
         }
     }
@@ -205,16 +199,10 @@ fn raw_file_worker(
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::BrokenPipe
-                    || e.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
+            Err(e) => {
                 let _ = event_tx.send(SerialEvent::Error(e.to_string()));
                 let _ = event_tx.send(SerialEvent::Disconnected);
                 return;
-            }
-            Err(e) => {
-                let _ = event_tx.send(SerialEvent::Error(e.to_string()));
             }
         }
     }

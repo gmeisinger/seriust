@@ -214,6 +214,7 @@ pub struct App {
     serial_handle: Option<SerialHandle>,
     last_port_scan: Instant,
     config_snapshot: Option<SerialConfig>,
+    should_reconnect: bool,
 }
 
 impl App {
@@ -252,6 +253,7 @@ impl App {
             serial_handle: None,
             last_port_scan: Instant::now(),
             config_snapshot: None,
+            should_reconnect: false,
         }
     }
 
@@ -396,6 +398,7 @@ impl App {
             if self.last_port_scan.elapsed() >= Duration::from_secs(2) {
                 self.scan_ports();
                 self.last_port_scan = Instant::now();
+                self.try_auto_reconnect();
             }
 
             self.drain_serial_events();
@@ -874,6 +877,7 @@ impl App {
                 self.serial_handle = Some(handle);
                 self.connection_status = ConnectionStatus::Connected;
                 self.port_error = None;
+                self.should_reconnect = false;
                 self.append_output("[Connected]\n");
             }
             Err(e) => {
@@ -889,8 +893,26 @@ impl App {
             handle.disconnect();
         }
         self.connection_status = ConnectionStatus::Disconnected;
+        self.should_reconnect = false;
         self.append_output("[Disconnected]\n");
         self.dirty = true;
+    }
+
+    fn try_auto_reconnect(&mut self) {
+        if !self.should_reconnect || self.connection_status == ConnectionStatus::Connected {
+            return;
+        }
+        let Some(target) = self.serial_config.port_info.as_ref() else {
+            return;
+        };
+        let target_name = target.port_name.clone();
+        if self
+            .available_ports
+            .iter()
+            .any(|p| p.port_name == target_name)
+        {
+            self.try_connect();
+        }
     }
 
     fn drain_serial_events(&mut self) {
@@ -929,10 +951,12 @@ impl App {
         if disconnected_event {
             self.serial_handle = None;
             self.connection_status = ConnectionStatus::Disconnected;
+            self.should_reconnect = self.serial_config.port_info.is_some();
             self.append_output("[Disconnected]\n");
         } else if connection_lost {
             self.serial_handle = None;
             self.connection_status = ConnectionStatus::Disconnected;
+            self.should_reconnect = self.serial_config.port_info.is_some();
             self.append_output("[Connection lost]\n");
         }
 
