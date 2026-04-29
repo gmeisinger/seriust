@@ -1,13 +1,15 @@
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     symbols::border,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use std::io::Write;
 
-use crate::app::{App, AppState, ConnectionStatus, InputMode, MenuItem};
+use crate::app::{App, AppState, ConnectionStatus, InputMode, MenuItem, Selection, SelectionMode};
 
 fn parity_char(p: serialport::Parity) -> char {
     match p {
@@ -33,7 +35,7 @@ fn stop_bits_char(s: serialport::StopBits) -> char {
     }
 }
 
-pub fn draw(app: &App, frame: &mut Frame) {
+pub fn draw(app: &mut App, frame: &mut Frame) {
     let title_style = if app.connection_status == ConnectionStatus::Connected {
         Style::default().fg(Color::Green).bold()
     } else {
@@ -80,7 +82,10 @@ pub fn draw(app: &App, frame: &mut Frame) {
     }
 }
 
-fn render_output(app: &App, frame: &mut Frame, area: Rect) {
+fn render_output(app: &mut App, frame: &mut Frame, area: Rect) {
+    app.last_output_height = area.height;
+    app.last_output_area = area;
+
     let block = Block::new();
 
     if let Some(err) = &app.port_error {
@@ -94,25 +99,301 @@ fn render_output(app: &App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    let cleaned = strip_ansi_escapes::strip_str(&app.output_buffer);
-    let lines: Vec<Line> = cleaned
-        .lines()
-        .map(|l| Line::from(l.to_string()))
-        .collect();
+    app.recompute_heights_for_width(area.width);
 
-    let paragraph = Paragraph::new(lines)
+    let pending_stripped = if app.output_pending.is_empty() {
+        String::new()
+    } else {
+        strip_ansi_escapes::strip_str(&app.output_pending)
+    };
+    let pending_height = if pending_stripped.is_empty() {
+        0_u16
+    } else {
+        crate::app::compute_line_height(&pending_stripped, area.width)
+    };
+
+    let total_visual_lines = app.total_visual_lines();
+    let max_offset = total_visual_lines.saturating_sub(area.height);
+
+    let scroll = if app.auto_scroll {
+        max_offset
+    } else {
+        app.scroll_top = app.scroll_top.min(max_offset);
+        app.scroll_top
+    };
+
+    app.last_total_visual_lines = total_visual_lines;
+    app.last_scroll = scroll;
+
+    let viewport_end = (scroll as u32) + (area.height as u32);
+
+    let mut acc: u32 = 0;
+    let mut start_idx: usize = app.output_lines.len() + 1;
+    let mut start_offset: u16 = 0;
+    let mut end_idx: usize = app.output_lines.len();
+    let has_pending = !pending_stripped.is_empty();
+    let total_count = app.output_lines.len() + if has_pending { 1 } else { 0 };
+
+    for i in 0..total_count {
+        let h = if i < app.output_lines.len() {
+            app.output_lines[i].height as u32
+        } else {
+            pending_height as u32
+        };
+        let line_top = acc;
+        let line_bottom = acc + h;
+
+        if start_idx > app.output_lines.len() && line_bottom > scroll as u32 {
+            start_idx = i;
+            start_offset = (scroll as u32 - line_top).min(u16::MAX as u32) as u16;
+        }
+        if start_idx <= app.output_lines.len() && line_top >= viewport_end {
+            end_idx = i;
+            break;
+        }
+        acc = line_bottom;
+        if i == total_count - 1 {
+            end_idx = total_count;
+        }
+    }
+
+    let mut visible_lines: Vec<Line> = Vec::with_capacity(end_idx.saturating_sub(start_idx));
+    if start_idx <= app.output_lines.len() {
+        for i in start_idx..end_idx {
+            let text = if i < app.output_lines.len() {
+                app.output_lines[i].text.as_str()
+            } else {
+                pending_stripped.as_str()
+            };
+            visible_lines.push(Line::from(text.to_string()));
+        }
+    }
+
+    let paragraph = Paragraph::new(visible_lines)
         .block(block)
         .wrap(Wrap { trim: false });
 
-    let total_visual_lines = paragraph.line_count(area.width) as usize;
-    let visible_height = area.height as usize;
-    let scroll = if total_visual_lines > visible_height {
-        (total_visual_lines - visible_height) as u16
-    } else {
-        0
+    frame.render_widget(paragraph.scroll((start_offset, 0)), area);
+
+    apply_selection(app, frame, area);
+}
+
+fn apply_selection(app: &mut App, frame: &mut Frame, area: Rect) {
+    let Some(sel) = app.selection else {
+        return;
     };
 
-    frame.render_widget(paragraph.scroll((scroll, 0)), area);
+    let buf = frame.buffer_mut();
+    let scroll = app.last_scroll;
+
+    let Some((start, end)) = compute_selection_range(&sel, area, scroll, &*buf) else {
+        if app.copy_pending {
+            app.copy_pending = false;
+        }
+        return;
+    };
+
+    let text_to_copy = if app.copy_pending && should_copy(&sel) {
+        Some(extract_selected_text(area, start, end, scroll, &*buf))
+    } else {
+        None
+    };
+
+    let viewport_end = scroll.saturating_add(area.height);
+    let visible_start_vline = start.1.max(scroll);
+    let visible_end_vline = end.1.min(viewport_end.saturating_sub(1));
+    let max_col = area.width.saturating_sub(1);
+
+    if visible_start_vline <= visible_end_vline && area.height > 0 && area.width > 0 {
+        for vline in visible_start_vline..=visible_end_vline {
+            let screen_y = area.y + (vline - scroll);
+            let col_start = if vline == start.1 { start.0.min(max_col) } else { 0 };
+            let col_end = if vline == end.1 { end.0.min(max_col) } else { max_col };
+            for col in col_start..=col_end {
+                let screen_x = area.x + col;
+                if let Some(cell) = buf.cell_mut((screen_x, screen_y)) {
+                    let new_style = cell.style().add_modifier(Modifier::REVERSED);
+                    cell.set_style(new_style);
+                }
+            }
+        }
+    }
+
+    if app.copy_pending {
+        app.copy_pending = false;
+        if let Some(text) = text_to_copy
+            && !text.is_empty()
+        {
+            let _ = copy_to_clipboard(&text);
+        }
+    }
+}
+
+fn should_copy(sel: &Selection) -> bool {
+    !(sel.mode == SelectionMode::Char && sel.anchor == sel.cursor)
+}
+
+fn vline_to_screen_y(vline: u16, scroll: u16, area: Rect) -> Option<u16> {
+    if vline < scroll {
+        return None;
+    }
+    let rel = vline - scroll;
+    if rel >= area.height {
+        return None;
+    }
+    Some(area.y + rel)
+}
+
+fn compute_selection_range(
+    sel: &Selection,
+    area: Rect,
+    scroll: u16,
+    buf: &Buffer,
+) -> Option<((u16, u16), (u16, u16))> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let (a, c) = (sel.anchor, sel.cursor);
+    // Order by (vline, col)
+    let (start, end) = if (a.1, a.0) <= (c.1, c.0) {
+        (a, c)
+    } else {
+        (c, a)
+    };
+    match sel.mode {
+        SelectionMode::Char => Some((start, end)),
+        SelectionMode::Line => Some(((0, start.1), (area.width.saturating_sub(1), end.1))),
+        SelectionMode::Word => Some((
+            expand_to_word_start(start, area, scroll, buf),
+            expand_to_word_end(end, area, scroll, buf),
+        )),
+    }
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn cell_first_char(buf: &Buffer, x: u16, y: u16) -> Option<char> {
+    buf.cell((x, y))?.symbol().chars().next()
+}
+
+fn expand_to_word_start(pos: (u16, u16), area: Rect, scroll: u16, buf: &Buffer) -> (u16, u16) {
+    let (mut col, vline) = pos;
+    let Some(screen_y) = vline_to_screen_y(vline, scroll, area) else {
+        return pos;
+    };
+    let max_col = area.width.saturating_sub(1);
+    if col > max_col {
+        return pos;
+    }
+    if !cell_first_char(buf, area.x + col, screen_y).is_some_and(is_word_char) {
+        return pos;
+    }
+    while col > 0 {
+        if !cell_first_char(buf, area.x + col - 1, screen_y).is_some_and(is_word_char) {
+            break;
+        }
+        col -= 1;
+    }
+    (col, vline)
+}
+
+fn expand_to_word_end(pos: (u16, u16), area: Rect, scroll: u16, buf: &Buffer) -> (u16, u16) {
+    let (mut col, vline) = pos;
+    let Some(screen_y) = vline_to_screen_y(vline, scroll, area) else {
+        return pos;
+    };
+    let max_col = area.width.saturating_sub(1);
+    if col > max_col {
+        return pos;
+    }
+    if !cell_first_char(buf, area.x + col, screen_y).is_some_and(is_word_char) {
+        return pos;
+    }
+    while col < max_col {
+        if !cell_first_char(buf, area.x + col + 1, screen_y).is_some_and(is_word_char) {
+            break;
+        }
+        col += 1;
+    }
+    (col, vline)
+}
+
+fn extract_selected_text(
+    area: Rect,
+    start: (u16, u16),
+    end: (u16, u16),
+    scroll: u16,
+    buf: &Buffer,
+) -> String {
+    let mut result = String::new();
+    let max_col = area.width.saturating_sub(1);
+    let viewport_end = scroll.saturating_add(area.height);
+    let visible_start = start.1.max(scroll);
+    let visible_end = end.1.min(viewport_end.saturating_sub(1));
+
+    if visible_start > visible_end {
+        return result;
+    }
+
+    for vline in visible_start..=visible_end {
+        let screen_y = area.y + (vline - scroll);
+        let col_start = if vline == start.1 {
+            start.0.min(max_col)
+        } else {
+            0
+        };
+        let col_end = if vline == end.1 {
+            end.0.min(max_col)
+        } else {
+            max_col
+        };
+        let mut line = String::new();
+        for col in col_start..=col_end {
+            let screen_x = area.x + col;
+            if let Some(cell) = buf.cell((screen_x, screen_y)) {
+                line.push_str(cell.symbol());
+            }
+        }
+        result.push_str(line.trim_end());
+        if vline < visible_end {
+            result.push('\n');
+        }
+    }
+    result
+}
+
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    let encoded = base64_encode(text.as_bytes());
+    let seq = format!("\x1b]52;c;{}\x07", encoded);
+    let mut stdout = std::io::stdout();
+    stdout.write_all(seq.as_bytes())?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        result.push(CHARS[(b0 >> 2) as usize] as char);
+        result.push(CHARS[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(b2 & 0x3f) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
 }
 
 fn render_input(app: &App, frame: &mut Frame, area: Rect) {
@@ -169,6 +450,14 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
         indicator_span,
         Span::from(format!("{:<12} ", status_text)),
     ];
+
+    if !app.auto_scroll {
+        spans.push(Span::styled(
+            " PAUSED ",
+            Style::default().fg(Color::Yellow).bold(),
+        ));
+        spans.push(Span::from(" "));
+    }
 
     if app.input_mode == InputMode::Hex {
         spans.push(Span::styled(

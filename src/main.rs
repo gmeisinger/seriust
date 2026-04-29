@@ -7,6 +7,21 @@ use std::io;
 
 use app::App;
 
+struct MouseCaptureGuard;
+
+impl MouseCaptureGuard {
+    fn new() -> io::Result<Self> {
+        crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for MouseCaptureGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
+    }
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "seriust", about = "TUI serial monitor")]
 pub struct Args {
@@ -37,5 +52,8 @@ pub struct Args {
 
 fn main() -> io::Result<()> {
     let args: Args = Parser::parse();
-    ratatui::run(|terminal| App::new(args.clone()).run(terminal))
+    ratatui::run(|terminal| {
+        let _mouse_guard = MouseCaptureGuard::new()?;
+        App::new(args.clone()).run(terminal)
+    })
 }
