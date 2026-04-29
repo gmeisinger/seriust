@@ -101,15 +101,15 @@ fn render_output(app: &mut App, frame: &mut Frame, area: Rect) {
 
     app.recompute_heights_for_width(area.width);
 
-    let pending_stripped = if app.output_pending.is_empty() {
-        String::new()
+    let (pending_line, pending_plain) = if app.output_pending.is_empty() {
+        (Line::default(), String::new())
     } else {
-        strip_ansi_escapes::strip_str(&app.output_pending)
+        crate::app::parse_ansi_line(&app.output_pending)
     };
-    let pending_height = if pending_stripped.is_empty() {
+    let pending_height = if pending_plain.is_empty() {
         0_u16
     } else {
-        crate::app::compute_line_height(&pending_stripped, area.width)
+        crate::app::compute_line_height(&pending_plain, area.width)
     };
 
     let total_visual_lines = app.total_visual_lines();
@@ -131,7 +131,7 @@ fn render_output(app: &mut App, frame: &mut Frame, area: Rect) {
     let mut start_idx: usize = app.output_lines.len() + 1;
     let mut start_offset: u16 = 0;
     let mut end_idx: usize = app.output_lines.len();
-    let has_pending = !pending_stripped.is_empty();
+    let has_pending = !pending_plain.is_empty();
     let total_count = app.output_lines.len() + if has_pending { 1 } else { 0 };
 
     for i in 0..total_count {
@@ -160,12 +160,12 @@ fn render_output(app: &mut App, frame: &mut Frame, area: Rect) {
     let mut visible_lines: Vec<Line> = Vec::with_capacity(end_idx.saturating_sub(start_idx));
     if start_idx <= app.output_lines.len() {
         for i in start_idx..end_idx {
-            let text = if i < app.output_lines.len() {
-                app.output_lines[i].text.as_str()
+            let line = if i < app.output_lines.len() {
+                app.output_lines[i].line.clone()
             } else {
-                pending_stripped.as_str()
+                pending_line.clone()
             };
-            visible_lines.push(Line::from(text.to_string()));
+            visible_lines.push(line);
         }
     }
 

@@ -6,8 +6,10 @@ use std::io;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use ansi_to_tui::IntoText;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::serial::{self, SerialCommand, SerialConfig, SerialEvent, SerialHandle};
@@ -22,7 +24,8 @@ const DOUBLE_CLICK_MS: u128 = 500;
 
 #[derive(Debug, Clone)]
 pub struct CachedLine {
-    pub text: String,
+    pub line: Line<'static>,
+    pub plain: String,
     pub height: u16,
 }
 
@@ -32,6 +35,15 @@ pub fn compute_line_height(text: &str, width: u16) -> u16 {
     }
     let p = Paragraph::new(text).wrap(Wrap { trim: false });
     p.line_count(width).max(1).min(u16::MAX as usize) as u16
+}
+
+pub fn parse_ansi_line(raw: &str) -> (Line<'static>, String) {
+    let line = match raw.into_text() {
+        Ok(mut text) if !text.lines.is_empty() => text.lines.remove(0),
+        _ => Line::from(raw.to_string()),
+    };
+    let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    (line, plain)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -913,14 +925,15 @@ impl App {
         while let Some(idx) = self.output_pending.find('\n') {
             let raw_line = self.output_pending[..idx].to_string();
             self.output_pending.drain(..=idx);
-            let stripped = strip_ansi_escapes::strip_str(&raw_line);
+            let (line, plain) = parse_ansi_line(&raw_line);
             let height = if self.cached_width > 0 {
-                compute_line_height(&stripped, self.cached_width)
+                compute_line_height(&plain, self.cached_width)
             } else {
                 1
             };
             self.output_lines.push(CachedLine {
-                text: stripped,
+                line,
+                plain,
                 height,
             });
         }
@@ -955,8 +968,8 @@ impl App {
         let pending = if self.output_pending.is_empty() {
             0
         } else if self.cached_width > 0 {
-            let stripped = strip_ansi_escapes::strip_str(&self.output_pending);
-            compute_line_height(&stripped, self.cached_width) as u32
+            let (_, plain) = parse_ansi_line(&self.output_pending);
+            compute_line_height(&plain, self.cached_width) as u32
         } else {
             1
         };
@@ -972,7 +985,7 @@ impl App {
             self.copy_pending = false;
         }
         for line in &mut self.output_lines {
-            line.height = compute_line_height(&line.text, width);
+            line.height = compute_line_height(&line.plain, width);
         }
         self.cached_width = width;
     }
