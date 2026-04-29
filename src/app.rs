@@ -19,6 +19,7 @@ pub const BAUD_RATES: &[u32] = &[
     300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600,
 ];
 const MAX_OUTPUT_LINES: usize = 5000;
+const MAX_INPUT_HISTORY: usize = 100;
 const WHEEL_STEP: u16 = 3;
 const DOUBLE_CLICK_MS: u128 = 500;
 
@@ -185,6 +186,9 @@ pub struct App {
     pub serial_config: SerialConfig,
     pub app_state: AppState,
     pub input_buffer: String,
+    pub input_history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub input_draft: String,
     pub output_lines: Vec<CachedLine>,
     pub output_pending: String,
     pub cached_width: u16,
@@ -220,6 +224,9 @@ impl App {
             serial_config: SerialConfig::default(),
             app_state: AppState::Capturing,
             input_buffer: String::new(),
+            input_history: Vec::new(),
+            history_index: None,
+            input_draft: String::new(),
             output_lines: Vec::new(),
             output_pending: String::new(),
             cached_width: 0,
@@ -566,15 +573,25 @@ impl App {
                     self.auto_scroll = true;
                     return;
                 }
+                KeyCode::Up => {
+                    self.history_prev();
+                    return;
+                }
+                KeyCode::Down => {
+                    self.history_next();
+                    return;
+                }
                 _ => {}
             }
             match self.input_mode {
                 InputMode::Ascii => match key_event.code {
                     KeyCode::Char(c) => {
                         self.input_buffer.push(c);
+                        self.history_index = None;
                     }
                     KeyCode::Backspace => {
                         self.input_buffer.pop();
+                        self.history_index = None;
                     }
                     KeyCode::Enter => {
                         self.send_input();
@@ -584,9 +601,11 @@ impl App {
                 InputMode::Hex => match key_event.code {
                     KeyCode::Char(c) if c.is_ascii_hexdigit() => {
                         self.input_buffer.push(c.to_ascii_uppercase());
+                        self.history_index = None;
                     }
                     KeyCode::Backspace => {
                         self.input_buffer.pop();
+                        self.history_index = None;
                     }
                     KeyCode::Enter => {
                         self.send_input();
@@ -1008,7 +1027,8 @@ impl App {
                     let echo = format!("{}\n", self.input_buffer);
                     self.append_output(&echo);
                 }
-                self.input_buffer.clear();
+                let entry = std::mem::take(&mut self.input_buffer);
+                self.push_history(entry);
             }
             InputMode::Hex => {
                 let hex_str: String = self
@@ -1035,8 +1055,53 @@ impl App {
                         bytes.iter().map(|b| format!("{:02X}", b)).collect();
                     self.append_output(&format!("[TX: {}]\n", hex_display.join(" ")));
                 }
-                self.input_buffer.clear();
+                let entry = std::mem::take(&mut self.input_buffer);
+                self.push_history(entry);
             }
+        }
+    }
+
+    fn push_history(&mut self, entry: String) {
+        self.history_index = None;
+        self.input_draft.clear();
+        if entry.is_empty() {
+            return;
+        }
+        if self.input_history.last().is_some_and(|prev| *prev == entry) {
+            return;
+        }
+        self.input_history.push(entry);
+        if self.input_history.len() > MAX_INPUT_HISTORY {
+            self.input_history.remove(0);
+        }
+    }
+
+    fn history_prev(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let new_index = match self.history_index {
+            None => {
+                self.input_draft = self.input_buffer.clone();
+                self.input_history.len() - 1
+            }
+            Some(0) => return,
+            Some(i) => i - 1,
+        };
+        self.history_index = Some(new_index);
+        self.input_buffer = self.input_history[new_index].clone();
+    }
+
+    fn history_next(&mut self) {
+        let Some(i) = self.history_index else {
+            return;
+        };
+        if i + 1 < self.input_history.len() {
+            self.history_index = Some(i + 1);
+            self.input_buffer = self.input_history[i + 1].clone();
+        } else {
+            self.history_index = None;
+            self.input_buffer = std::mem::take(&mut self.input_draft);
         }
     }
 
